@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import os
 import time
-from collections import deque
+from collections import defaultdict, deque
 from contextlib import contextmanager
 
 import torch
@@ -239,6 +239,7 @@ class FastSacRunner:
         lenbuffer = deque(maxlen=100)
         cur_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=device)
         cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=device)
+        reward_log_buffers: dict[str, deque] = defaultdict(lambda: deque(maxlen=100))
 
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
@@ -265,6 +266,19 @@ class FastSacRunner:
             lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
             cur_reward_sum[new_ids] = 0
             cur_episode_length[new_ids] = 0
+
+            # Collect per-term reward logs from episodes that just ended
+            if new_ids.numel() > 0 and "log" in infos:
+                reset_ids = new_ids[:, 0]
+                for key, value in infos["log"].items():
+                    if isinstance(value, torch.Tensor):
+                        if value.numel() == self.env.num_envs:
+                            vals = value[reset_ids].cpu().float().tolist()
+                        else:
+                            vals = [value.mean().item()]
+                    else:
+                        vals = [float(value)]
+                    reward_log_buffers[key].extend(vals)
 
             # IsaacLab auto-resets: obs_td is already post-reset for done envs.
             # For the replay buffer, we need pre-reset obs. We use time_outs from extras
@@ -335,7 +349,7 @@ class FastSacRunner:
 
             # --- Logging ---
             if not self.disable_logs and it % alg["logging_interval"] == 0 and it > 0:
-                self._log(it, rewbuffer, lenbuffer, collection_time, learn_time, locals())
+                self._log(it, rewbuffer, lenbuffer, collection_time, learn_time, locals(), reward_log_buffers)
 
             # --- Saving ---
             if (
@@ -686,7 +700,16 @@ class FastSacRunner:
         except ImportError:
             print("TensorBoard not available. Install tensorboard for logging support.")
 
-    def _log(self, it: int, rewbuffer, lenbuffer, collection_time: float, learn_time: float, locs: dict):
+    def _log(
+        self,
+        it: int,
+        rewbuffer,
+        lenbuffer,
+        collection_time: float,
+        learn_time: float,
+        locs: dict,
+        reward_log_buffers: dict | None = None,
+    ):
         """Log training metrics."""
         if self.writer is None:
             return
@@ -707,6 +730,12 @@ class FastSacRunner:
         self.writer.add_scalar("Alpha/value", self.log_alpha.exp().item(), it)
         self.writer.add_scalar("Perf/collection_time", collection_time, it)
         self.writer.add_scalar("Perf/learn_time", learn_time, it)
+
+        # Log per-term reward statistics
+        if reward_log_buffers:
+            for key, buf in reward_log_buffers.items():
+                if len(buf) > 0:
+                    self.writer.add_scalar(f"Rewards/{key}", sum(buf) / len(buf), it)
 
         if len(rewbuffer) > 0:
             print(f"[{it}] reward: {mean_reward:.2f} | ep_len: {mean_length:.0f} | alpha: {self.log_alpha.exp().item():.4f}")
